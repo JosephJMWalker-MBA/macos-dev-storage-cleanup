@@ -1,0 +1,12 @@
+# CacheWarden configuration
+# Use whole-number values only.
+
+# Run automatic cleanup only when available storage is below this amount.
+THRESHOLD_GB=30
+
+# Set a cleanup category to 0 to disable it.
+ENABLE_GRADLE=1
+ENABLE_NPM=1
+ENABLE_PIP=1
+ENABLE_HOMEBREW=1
+ENABLE_CLAUDE_TEMP=1
