@@ -51,6 +51,28 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+trim_whitespace() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  print -r -- "$value"
+}
+
+validate_nonnegative_integer() {
+  local key="$1"
+  local value="$2"
+
+  case "$value" in
+    ''|*[!0-9]*) fail "$key must be a non-negative integer." ;;
+  esac
+}
+
+validate_toggle() {
+  local key="$1"
+  local value="$2"
+  [[ "$value" == "0" || "$value" == "1" ]] || fail "$key must be either 0 or 1."
+}
+
 free_kb() {
   /bin/df -Pk "$DATA_VOLUME" | /usr/bin/awk 'NR == 2 { print $4 }'
 }
@@ -83,15 +105,59 @@ approved_target() {
   esac
 }
 
-remove_approved_path() {
-  local description="$1"
-  local target="$2"
-  local before_kb
+resolved_target_path() {
+  local target="$1"
+  local parent="${target%/*}"
+  local base="${target##*/}"
+  local resolved_parent
+
+  [[ -n "$parent" ]] || parent="/"
+  resolved_parent="$(cd -P "$parent" 2>/dev/null && pwd -P)" || return 1
+
+  if [[ "$resolved_parent" == "/" ]]; then
+    print -r -- "/$base"
+  else
+    print -r -- "$resolved_parent/$base"
+  fi
+}
+
+validate_direct_target() {
+  local target="$1"
+  local resolved
 
   approved_target "$target" || {
     log "REFUSED: '$target' is not in CacheWarden's approved target list."
     return 1
   }
+
+  if [[ -L "$target" ]]; then
+    log "REFUSED: '$target' is a symbolic link; direct cleanup never follows symlink targets."
+    return 1
+  fi
+
+  if [[ ! -e "$target" ]]; then
+    return 0
+  fi
+
+  resolved="$(resolved_target_path "$target")" || {
+    log "REFUSED: could not resolve the parent path for '$target'."
+    return 1
+  }
+
+  if [[ "$resolved" != "$target" ]]; then
+    log "REFUSED: '$target' resolves through a different parent path ('$resolved')."
+    return 1
+  fi
+
+  return 0
+}
+
+remove_approved_path() {
+  local description="$1"
+  local target="$2"
+  local before_kb
+
+  validate_direct_target "$target" || return 1
 
   if [[ ! -e "$target" ]]; then
     log "Skipping $description; target does not exist."
@@ -111,25 +177,61 @@ remove_approved_path() {
 
 load_config() {
   if [[ -f "$CONFIG_FILE" ]]; then
-    # The config is created in the user's home directory by install.sh.
-    # It should contain only CacheWarden's documented KEY=VALUE settings.
-    source "$CONFIG_FILE"
+    local line
+    local key
+    local value
+    local line_number=0
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      (( line_number += 1 ))
+      line="$(trim_whitespace "$line")"
+
+      [[ -z "$line" || "$line" == \#* ]] && continue
+      [[ "$line" == *=* ]] || fail "Invalid config line $line_number: expected KEY=VALUE."
+
+      key="$(trim_whitespace "${line%%=*}")"
+      value="$(trim_whitespace "${line#*=}")"
+
+      case "$key" in
+        THRESHOLD_GB)
+          validate_nonnegative_integer "$key" "$value"
+          THRESHOLD_GB="$value"
+          ;;
+        ENABLE_GRADLE)
+          validate_toggle "$key" "$value"
+          ENABLE_GRADLE="$value"
+          ;;
+        ENABLE_NPM)
+          validate_toggle "$key" "$value"
+          ENABLE_NPM="$value"
+          ;;
+        ENABLE_PIP)
+          validate_toggle "$key" "$value"
+          ENABLE_PIP="$value"
+          ;;
+        ENABLE_HOMEBREW)
+          validate_toggle "$key" "$value"
+          ENABLE_HOMEBREW="$value"
+          ;;
+        ENABLE_CLAUDE_TEMP)
+          validate_toggle "$key" "$value"
+          ENABLE_CLAUDE_TEMP="$value"
+          ;;
+        *)
+          fail "Unknown configuration key '$key' on line $line_number."
+          ;;
+      esac
+    done < "$CONFIG_FILE"
   else
     log "Configuration not found at '$CONFIG_FILE'; using built-in defaults."
   fi
 
-  [[ "$THRESHOLD_GB" == <-> ]] || fail "THRESHOLD_GB must be a non-negative integer."
-
-  local toggle
-  for toggle in \
-    "$ENABLE_GRADLE" \
-    "$ENABLE_NPM" \
-    "$ENABLE_PIP" \
-    "$ENABLE_HOMEBREW" \
-    "$ENABLE_CLAUDE_TEMP"; do
-    [[ "$toggle" == "0" || "$toggle" == "1" ]] || \
-      fail "Cleanup toggles must be either 0 or 1."
-  done
+  validate_nonnegative_integer "THRESHOLD_GB" "$THRESHOLD_GB"
+  validate_toggle "ENABLE_GRADLE" "$ENABLE_GRADLE"
+  validate_toggle "ENABLE_NPM" "$ENABLE_NPM"
+  validate_toggle "ENABLE_PIP" "$ENABLE_PIP"
+  validate_toggle "ENABLE_HOMEBREW" "$ENABLE_HOMEBREW"
+  validate_toggle "ENABLE_CLAUDE_TEMP" "$ENABLE_CLAUDE_TEMP"
 }
 
 while (( $# > 0 )); do
@@ -155,7 +257,7 @@ done
 load_config
 
 FREE_BEFORE_KB="$(free_kb)"
-[[ "$FREE_BEFORE_KB" == <-> ]] || fail "Could not determine available storage."
+validate_nonnegative_integer "available storage" "$FREE_BEFORE_KB"
 
 THRESHOLD_KB=$(( THRESHOLD_GB * 1024 * 1024 ))
 FREE_BEFORE_GB=$(( FREE_BEFORE_KB / 1024 / 1024 ))
@@ -250,7 +352,7 @@ if (( ! DRY_RUN )); then
 fi
 
 FREE_AFTER_KB="$(free_kb)"
-[[ "$FREE_AFTER_KB" == <-> ]] || fail "Could not determine storage after cleanup."
+validate_nonnegative_integer "available storage after cleanup" "$FREE_AFTER_KB"
 
 FREE_AFTER_GB=$(( FREE_AFTER_KB / 1024 / 1024 ))
 RECOVERED_KB=$(( FREE_AFTER_KB - FREE_BEFORE_KB ))
