@@ -2,26 +2,48 @@
 
 **Threshold-aware storage maintenance for macOS development machines.**
 
-CacheWarden is a conservative, `launchd`-powered utility that checks the free space on your Mac's Data volume and clears selected **rebuildable developer caches** only when available storage falls below a configurable threshold.
+CacheWarden is a conservative, `launchd`-powered utility that checks the free space on your Mac's Data volume and performs selected **rebuildable developer-cache cleanup** only when available storage falls below a configurable threshold.
 
 It was created after a development Mac reached 98% capacity with only 5.2 GB available. A manual audit recovered roughly 27 GB; CacheWarden turns the repeatable portion of that cleanup into a small maintenance system.
 
 > [!WARNING]
-> CacheWarden uses recursive deletion for explicitly listed cache directories. Read the script before installing it. Back up important work, and never add personal-data paths to the cleanup list.
+> CacheWarden performs destructive cleanup. Review the script and configuration before installing it, back up important work, and use `--dry-run --force` before your first real cleanup. The direct recursive-deletion paths are intentionally fixed in code and should never be expanded to include personal-data locations.
 
 ## What it does
 
 - Checks `/System/Volumes/Data`, rather than relying only on the sealed macOS system volume.
-- Runs only when available storage is below `THRESHOLD_GB`.
-- Clears selected npm, pip, Gradle, Homebrew, and Claude temporary caches.
+- Runs automatically only when available storage is below `THRESHOLD_GB`.
+- Directly removes a small hardcoded allowlist of rebuildable Gradle, npm, pip, and Claude temporary cache paths.
+- Refuses direct cleanup when an allowlisted target is itself a symbolic link or resolves through a different physical parent path.
+- Optionally delegates additional cleanup to `python3 -m pip cache purge` and `brew cleanup` when those tools are available.
 - Skips Gradle cleanup while Gradle or Android Studio appears active.
 - Skips Claude temporary cleanup while Claude appears active.
 - Records standard output and errors in `~/Library/Logs`.
 - Uses a per-user LaunchAgent; no `sudo` is required.
 
-## What it does not delete
+## Direct deletion boundary
 
-CacheWarden does **not** target:
+CacheWarden's own recursive deletion is limited to these exact paths:
+
+```text
+~/.gradle/caches
+~/.npm/_cacache
+~/.cache/pip
+/private/tmp/claude-<current-user-id>
+```
+
+Before calling `rm -rf`, CacheWarden verifies that the requested path matches that allowlist, refuses symbolic-link targets, and compares the target's physical parent path with the expected path. This is defense-in-depth against accidentally traversing a redirected cache path.
+
+That allowlist applies only to CacheWarden's **direct** recursive deletion. Two optional cleanup actions are delegated to their owning package managers:
+
+- `python3 -m pip cache purge`
+- `brew cleanup`
+
+Those commands determine their own cache-cleanup scope. They are not represented by the four direct paths above.
+
+## What it does not intentionally target
+
+CacheWarden does **not** intentionally target:
 
 - Documents or Downloads
 - Source repositories
@@ -30,6 +52,8 @@ CacheWarden does **not** target:
 - Downloaded AI models
 - Xcode installations or archives
 - Protected Apple system caches
+
+The package-manager commands described above remain governed by pip and Homebrew themselves, so review their behavior on your machine if that distinction matters to your workflow.
 
 ## Requirements
 
@@ -43,8 +67,8 @@ CacheWarden does **not** target:
 Clone the repository, review the files, and run the installer:
 
 ```bash
-git clone https://github.com/JosephJMWalker-MBA/macos-dev-storage-cleanup.git
-cd macos-dev-storage-cleanup
+git clone https://github.com/JosephJMWalker-MBA/CacheWarden.git
+cd CacheWarden
 less bin/cachewarden.zsh
 ./install.sh
 ```
@@ -82,6 +106,10 @@ ENABLE_CLAUDE_TEMP=1
 
 Set any cleanup toggle to `0` to disable it.
 
+The configuration file is parsed as data; it is **not sourced or evaluated as shell code**. CacheWarden accepts only the six documented keys above. `THRESHOLD_GB` must be a non-negative whole number, cleanup toggles must be `0` or `1`, and unknown or malformed settings cause the run to fail closed.
+
+The installer creates the configuration with user-only permissions (`600`). Keep it user-owned and do not use it as a general shell startup file.
+
 ## Run manually
 
 Normal threshold-aware run:
@@ -90,17 +118,31 @@ Normal threshold-aware run:
 ~/.local/bin/cachewarden
 ```
 
-Inspect what CacheWarden would target without deleting anything:
+Inspect the direct targets and requested delegated actions without deleting anything:
 
 ```bash
 ~/.local/bin/cachewarden --dry-run
 ```
 
-Force a cleanup even when free space is above the threshold:
+For a first-run audit, bypass the storage threshold while still preventing deletion:
+
+```bash
+~/.local/bin/cachewarden --dry-run --force
+```
+
+Force a real cleanup even when free space is above the threshold:
 
 ```bash
 ~/.local/bin/cachewarden --force
 ```
+
+### Dry-run boundary
+
+In dry-run mode:
+
+- direct allowlisted paths are measured and reported but not removed;
+- pip cleanup is reported as the command that would be requested rather than enumerating every pip-managed target; and
+- Homebrew is asked to preview cleanup with `brew cleanup -n`.
 
 ## Inspect the logs
 
@@ -127,16 +169,27 @@ launchctl kickstart -k "gui/$(id -u)/com.cachewarden.storage-cleanup"
 ./uninstall.sh
 ```
 
-The uninstaller removes the LaunchAgent and installed executable. It preserves the configuration and logs unless you explicitly choose to remove them.
+The uninstaller removes the LaunchAgent and installed executable. It preserves the configuration and logs unless you explicitly choose to remove them with `./uninstall.sh --purge`.
 
 ## Design principles
 
-1. **Inspect before deleting.** The cleanup scope is visible and intentionally small.
+1. **Inspect before deleting.** The direct cleanup scope is visible and intentionally small.
 2. **Thresholds over constant purging.** Caches improve development speed and should not be erased without a reason.
-3. **User files are out of scope.** CacheWarden cleans reproducible artifacts, not creative work.
-4. **No elevated privileges.** A personal maintenance tool should not require system-wide authority.
-5. **Reversible installation.** Every installed component has a documented removal path.
+3. **User files are out of scope.** CacheWarden is designed around reproducible development artifacts, not creative work.
+4. **Fail closed on ambiguous paths or configuration.** Unknown settings and redirected direct-delete paths are refused rather than guessed through.
+5. **No elevated privileges.** A personal maintenance tool should not require system-wide authority.
+6. **Reversible installation.** Every installed component has a documented removal path.
 
-## Development status
+## Testing and verification status
 
-CacheWarden is an early public utility. Review the current implementation before relying on it in a production workflow. Reports about unexpected behavior, additional safe cache targets, and macOS compatibility are welcome through GitHub Issues.
+This repository currently does **not** include an automated test suite for destructive behavior or cross-version macOS compatibility. The implementation should therefore be treated as an early public utility rather than a broadly validated storage-management product.
+
+Before relying on it:
+
+1. read `bin/cachewarden.zsh`;
+2. inspect your configuration;
+3. run `cachewarden --dry-run --force`;
+4. review the reported direct paths and delegated commands; and
+5. only then allow a real cleanup run.
+
+Reports about unexpected behavior, additional safe cache targets, and macOS compatibility are welcome through GitHub Issues.
